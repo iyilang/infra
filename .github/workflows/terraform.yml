@@ -1,0 +1,99 @@
+name: Terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - name: Validate without cloud credentials
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+          python3 scripts/test-plan-gate.py
+          shellcheck bootstrap/bootstrap.sh
+          python3 scripts/test-workflow-gate.py
+
+  plan:
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IYI_PLAN_WIF_PROVIDER != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_billing_account: ${{ secrets.IYI_BILLING_ACCOUNT }}
+      TF_VAR_service_images: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
+      TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
+      TF_VAR_newsletter_database_secret_id: ${{ vars.IYI_NEWSLETTER_DATABASE_SECRET_ID || '' }}
+      TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
+      TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
+      TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.IYI_PLAN_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_PLAN_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - run: terraform -chdir=terraform init -input=false
+      - name: Create and check plan
+        run: |
+          terraform -chdir=terraform plan -input=false -lock=false -out="$RUNNER_TEMP/iyi.tfplan"
+          terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" > "$RUNNER_TEMP/iyi-plan.json"
+          python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json"
+
+  apply:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.IYI_APPLY_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: iyi-terraform-apply
+      cancel-in-progress: false
+    env:
+      TF_VAR_billing_account: ${{ secrets.IYI_BILLING_ACCOUNT }}
+      TF_VAR_service_images: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
+      TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
+      TF_VAR_newsletter_database_secret_id: ${{ vars.IYI_NEWSLETTER_DATABASE_SECRET_ID || '' }}
+      TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
+      TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
+      TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
+      IYI_PROJECT_ID: ${{ vars.IYI_PROJECT_ID || 'crystalshards-org' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_TERRAFORM_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - run: terraform -chdir=terraform init -input=false
+      - name: Create and check exact plan
+        run: |
+          terraform -chdir=terraform plan -input=false -out="$RUNNER_TEMP/iyi.tfplan"
+          terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" > "$RUNNER_TEMP/iyi-plan.json"
+          python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json"
+      - name: Apply checked plan
+        run: terraform -chdir=terraform apply -input=false "$RUNNER_TEMP/iyi.tfplan"
+      - name: Limit retained Hosting versions
+        run: scripts/set-hosting-retention.sh

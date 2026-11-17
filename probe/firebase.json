@@ -1,0 +1,15 @@
+{
+  "hosting": {
+    "site": "iyi-probe",
+    "public": "public",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "headers": [
+      {"source": "/", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]},
+      {"source": "**", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]}
+    ],
+    "rewrites": [
+      {"source": "/public/**", "run": {"serviceId": "iyi-probe-public", "region": "us-central1"}},
+      {"source": "/internal/**", "run": {"serviceId": "iyi-probe-internal", "region": "us-central1"}}
+    ]
+  }
+}

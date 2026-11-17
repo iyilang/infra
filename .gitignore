@@ -1,0 +1,14 @@
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.auto.tfvars
+.terraform.tfvars
+.env
+.env.*
+!.env.example
+credentials.json
+gha-creds-*.json
+.DS_Store
+__pycache__/
+*.pyc

@@ -44,10 +44,3 @@ resource "google_secret_manager_secret_iam_member" "sum_production" {
   role      = "roles/secretmanager.secretAccessor"
   member    = "serviceAccount:iyi-sum@${var.project_id}.iam.gserviceaccount.com"
 }
-
-resource "google_secret_manager_secret_iam_member" "newsletter" {
-  count     = var.newsletter_database_secret_id == "" ? 0 : 1
-  secret_id = "projects/${var.project_id}/secrets/${var.newsletter_database_secret_id}"
-  role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:iyi-newsletter@${var.project_id}.iam.gserviceaccount.com"
-}

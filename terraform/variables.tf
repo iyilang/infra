@@ -2,7 +2,11 @@ variable "project_id" {
   description = "Existing Google Cloud project."
   type        = string
   nullable    = false
-  default     = "crystalshards-org"
+  default     = "iyi-lang"
+  validation {
+    condition     = var.project_id == "iyi-lang"
+    error_message = "This root only manages the iyi-lang project."
+  }
 }
 
 variable "region" {
@@ -31,16 +35,6 @@ variable "public_base_urls" {
   type        = map(string)
   nullable    = false
   default     = {}
-}
-
-variable "newsletter_database_secret_id" {
-  description = "Secret Manager secret ID holding DATABASE_URL. Empty keeps the newsletter service undeployed."
-  type        = string
-  default     = ""
-  validation {
-    condition     = var.newsletter_database_secret_id == "" || can(regex("^iyi-", var.newsletter_database_secret_id))
-    error_message = "The newsletter database secret must use the iyi- prefix."
-  }
 }
 
 variable "custom_domains_enabled" {

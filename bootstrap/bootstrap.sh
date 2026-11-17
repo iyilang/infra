@@ -3,9 +3,9 @@ set -euo pipefail
 
 # This script is for review. --check is the default and is read-only. The
 # privileged --apply path must run only in an approved CI environment.
-PROJECT="${IYI_PROJECT_ID:-crystalshards-org}"
+PROJECT="${IYI_PROJECT_ID:-iyi-lang}"
 REGION="${IYI_REGION:-us-central1}"
-BUCKET="${IYI_TF_STATE_BUCKET:-crystalshards-org-iyi-tfstate}"
+BUCKET="${IYI_TF_STATE_BUCKET:-iyi-lang-tfstate}"
 POOL="iyi-github"
 TERRAFORM_ACCOUNT="iyi-terraform"
 PLAN_POOL="iyi-plan-github"
@@ -13,12 +13,12 @@ PLAN_ACCOUNT="iyi-terraform-plan"
 PLAN_ROLE="iyiTerraformRead"
 ROLE="iyiTerraformCreator"
 MODE="check"
-PRIVILEGED_SA="${IYI_EXISTING_PRIVILEGED_SA:-}"
+SENSITIVE_SA="${IYI_SENSITIVE_SERVICE_ACCOUNT:-firebase-adminsdk-fbsvc@${PROJECT}.iam.gserviceaccount.com}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DENY_POLICY="iyi-terraform-no-escalation"
 
 usage() {
-  printf '%s\n' 'Usage: bootstrap.sh [--check | --apply] [--privileged-service-account EMAIL]' \
+  printf '%s\n' 'Usage: bootstrap.sh [--check | --apply]' \
     'Default: --check. --apply changes Cloud resources and is intended only for approved CI.'
 }
 
@@ -26,16 +26,16 @@ while (($#)); do
   case "$1" in
     --check) MODE=check ;;
     --apply) MODE=apply ;;
-    --privileged-service-account)
-      if (($# < 2)); then usage >&2; exit 2; fi
-      PRIVILEGED_SA=$2
-      shift
-      ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ "$PROJECT" != iyi-lang ]]; then
+  echo 'Unexpected project; refusing to inspect or change resources.' >&2
+  exit 1
+fi
 
 for executable in gcloud jq grep; do
   command -v "$executable" >/dev/null || { printf 'Missing command: %s\n' "$executable" >&2; exit 1; }
@@ -67,7 +67,8 @@ check_apis() {
   enabled=$(gcloud services list --enabled --project="$PROJECT" --format='value(config.name)')
   for api in firebase.googleapis.com firebasehosting.googleapis.com run.googleapis.com \
     iam.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com \
-    artifactregistry.googleapis.com sts.googleapis.com billingbudgets.googleapis.com; do
+    artifactregistry.googleapis.com sts.googleapis.com cloudbilling.googleapis.com \
+    billingbudgets.googleapis.com serviceusage.googleapis.com; do
     if printf '%s\n' "$enabled" | grep -Fxq "$api"; then
       printf 'API %s: ENABLED\n' "$api"
     else
@@ -80,11 +81,11 @@ check_apis() {
 # empty direct service-account policy as proof. UNKNOWN is not a denial.
 check_privileged_access() {
   local resource permission access failed=0
-  if [[ -z "$PRIVILEGED_SA" ]]; then
-    echo 'Owner-account impersonation: UNPROVEN (supply --privileged-service-account)'
+  if ! gcloud iam service-accounts describe "$tf_email" --project="$PROJECT" --format=json >/dev/null 2>&1; then
+    echo 'Effective privilege checks: UNPROVEN (Terraform service account is unavailable)'
     return 1
   fi
-  resource="//iam.googleapis.com/projects/${PROJECT}/serviceAccounts/${PRIVILEGED_SA}"
+  resource="//iam.googleapis.com/projects/${PROJECT}/serviceAccounts/${SENSITIVE_SA}"
   for permission in iam.serviceAccounts.actAs iam.serviceAccounts.getAccessToken \
     iam.serviceAccounts.signBlob iam.serviceAccounts.signJwt \
     iam.serviceAccounts.implicitDelegation iam.serviceAccounts.setIamPolicy; do
@@ -125,16 +126,16 @@ check_all() {
   describe_status 'Workload identity pool' gcloud iam workload-identity-pools describe "$POOL" --location=global --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
   describe_status 'Plan workload identity pool' gcloud iam workload-identity-pools describe "$PLAN_POOL" --location=global --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
   describe_status 'Plan WIF provider infra' gcloud iam workload-identity-pools providers describe infra --workload-identity-pool="$PLAN_POOL" --location=global --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
-  for provider in infra modproxy newsletter; do
+  for provider in infra modproxy; do
     describe_status "WIF provider $provider" gcloud iam workload-identity-pools providers describe "$provider" \
       --workload-identity-pool="$POOL" --location=global --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
   done
-  for account in "$TERRAFORM_ACCOUNT" "$PLAN_ACCOUNT" iyi-modproxy-deployer iyi-newsletter-deployer iyi-proxy iyi-sum iyi-newsletter iyi-probe; do
+  for account in "$TERRAFORM_ACCOUNT" "$PLAN_ACCOUNT" iyi-modproxy-deployer iyi-proxy iyi-sum iyi-probe; do
     describe_status "Service account $account" gcloud iam service-accounts describe "${account}@${PROJECT}.iam.gserviceaccount.com" \
       --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
   done
   describe_status 'Terraform project custom role' gcloud iam roles describe "$ROLE" --project="$PROJECT" --format=json || { rc=$?; ((rc == 1)) || status=1; }
-  for name in infra modproxy newsletter; do
+  for name in infra modproxy; do
     repo="iyilang/$name"
     printf 'Provider %s required repository: %s\n' "$name" "$repo"
   done
@@ -151,15 +152,14 @@ if [[ "${CI:-}" != true ]]; then
   echo 'Refusing to mutate Google Cloud outside an approved CI environment.' >&2
   exit 1
 fi
-if [[ -z "$PRIVILEGED_SA" ]]; then
-  echo 'Supply --privileged-service-account before any mutation.' >&2
-  exit 1
-fi
 
-
-# The code below is intentionally not executed by --check.
-# APIs already managed by another stack are neither enabled here nor disabled.
-gcloud services enable sts.googleapis.com billingbudgets.googleapis.com --project="$PROJECT"
+# The code below is intentionally not executed by --check. Existing Firebase
+# services are left enabled and unmanaged. These required APIs are enabled
+# before identity, storage, and budget resources are created.
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com \
+  iam.googleapis.com iamcredentials.googleapis.com secretmanager.googleapis.com \
+  sts.googleapis.com cloudbilling.googleapis.com billingbudgets.googleapis.com \
+  --project="$PROJECT"
 
 if describe_status 'State bucket' gcloud storage buckets describe "gs://${BUCKET}" --project="$PROJECT" --format=json; then
   actual_project=$(gcloud storage buckets describe "gs://${BUCKET}" --format='value(projectNumber)')
@@ -210,12 +210,12 @@ ensure_provider() {
 
 ensure_pool "$POOL"
 ensure_pool "$PLAN_POOL"
-for name in infra modproxy newsletter; do
+for name in infra modproxy; do
   ensure_provider "$POOL" "$name" "assertion.repository == 'iyilang/${name}' && assertion.ref == 'refs/heads/main' && assertion.event_name == 'push'"
 done
 ensure_provider "$PLAN_POOL" infra "assertion.repository == 'iyilang/infra' && assertion.event_name == 'pull_request'"
 
-for account in "$TERRAFORM_ACCOUNT" "$PLAN_ACCOUNT" iyi-modproxy-deployer iyi-newsletter-deployer iyi-proxy iyi-sum iyi-newsletter iyi-probe; do
+for account in "$TERRAFORM_ACCOUNT" "$PLAN_ACCOUNT" iyi-modproxy-deployer iyi-proxy iyi-sum iyi-probe; do
   email="${account}@${PROJECT}.iam.gserviceaccount.com"
   if describe_status "Service account $account" gcloud iam service-accounts describe "$email" --project="$PROJECT" --format=json; then
     description=$(gcloud iam service-accounts describe "$email" --project="$PROJECT" --format='value(description)')
@@ -254,7 +254,7 @@ fi
 # No project IAM, service-account IAM, token minting, or pool administration
 # permissions occur in this role. Cloud Run service IAM needs a separate,
 # resource-scoped grant after creation; it is intentionally not granted here.
-permissions='resourcemanager.projects.get,serviceusage.services.use,run.services.create,run.services.get,run.services.list,run.services.getIamPolicy,run.operations.get,firebasehosting.sites.create,firebasehosting.sites.get,firebasehosting.sites.list,firebasehosting.sites.update,artifactregistry.repositories.create,artifactregistry.repositories.get,artifactregistry.repositories.list,secretmanager.secrets.create,secretmanager.secrets.get,secretmanager.secrets.list,storage.buckets.create,billing.resourcebudgets.read,billing.resourcebudgets.write'
+permissions='resourcemanager.projects.get,serviceusage.services.use,serviceusage.services.get,serviceusage.services.list,serviceusage.services.enable,run.services.create,run.services.get,run.services.list,run.services.getIamPolicy,run.operations.get,firebasehosting.sites.create,firebasehosting.sites.get,firebasehosting.sites.list,firebasehosting.sites.update,artifactregistry.repositories.create,artifactregistry.repositories.get,artifactregistry.repositories.list,secretmanager.secrets.create,secretmanager.secrets.get,secretmanager.secrets.list,storage.buckets.create,billing.resourcebudgets.read,billing.resourcebudgets.write'
 if describe_status 'Terraform custom role' gcloud iam roles describe "$ROLE" --project="$PROJECT" --format=json; then
   existing=$(gcloud iam roles describe "$ROLE" --project="$PROJECT" --format=json | jq -r '.includedPermissions | sort | join(",")')
   expected=$(printf '%s' "$permissions" | tr ',' '\n' | sort | paste -sd, -)
@@ -265,7 +265,7 @@ else
     --stage=GA --permissions="$permissions"
 fi
 
-plan_permissions='resourcemanager.projects.get,serviceusage.services.use,run.services.get,run.services.list,run.services.getIamPolicy,run.operations.get,firebasehosting.sites.get,firebasehosting.sites.list,artifactregistry.repositories.get,artifactregistry.repositories.list,secretmanager.secrets.get,secretmanager.secrets.getIamPolicy,secretmanager.versions.get,secretmanager.versions.list,storage.buckets.get,storage.buckets.getIamPolicy,storage.buckets.list,billing.resourcebudgets.read,logging.exclusions.get,logging.exclusions.list'
+plan_permissions='resourcemanager.projects.get,serviceusage.services.use,serviceusage.services.get,serviceusage.services.list,run.services.get,run.services.list,run.services.getIamPolicy,run.operations.get,firebasehosting.sites.get,firebasehosting.sites.list,artifactregistry.repositories.get,artifactregistry.repositories.list,secretmanager.secrets.get,secretmanager.secrets.getIamPolicy,secretmanager.versions.get,secretmanager.versions.list,storage.buckets.get,storage.buckets.getIamPolicy,storage.buckets.list,billing.resourcebudgets.read,logging.exclusions.get,logging.exclusions.list'
 if describe_status 'Terraform plan custom role' gcloud iam roles describe "$PLAN_ROLE" --project="$PROJECT" --format=json; then
   existing=$(gcloud iam roles describe "$PLAN_ROLE" --project="$PROJECT" --format=json | jq -r '.includedPermissions | sort | join(",")')
   expected=$(printf '%s' "$plan_permissions" | tr ',' '\n' | sort | paste -sd, -)
@@ -314,18 +314,18 @@ plan_member="principalSet://iam.googleapis.com/projects/${project_number}/locati
 gcloud iam service-accounts add-iam-policy-binding "$plan_email" --project="$PROJECT" \
   --role=roles/iam.workloadIdentityUser --member="$plan_member" --condition=None --quiet >/dev/null
 
-for pair in 'infra:iyi-terraform' 'modproxy:iyi-modproxy-deployer' 'newsletter:iyi-newsletter-deployer'; do
+for pair in 'infra:iyi-terraform' 'modproxy:iyi-modproxy-deployer'; do
   name=${pair%%:*}; account=${pair#*:}
   member="principalSet://iam.googleapis.com/projects/${project_number}/locations/global/workloadIdentityPools/${POOL}/attribute.repository/iyilang/${name}"
   gcloud iam service-accounts add-iam-policy-binding "${account}@${PROJECT}.iam.gserviceaccount.com" \
     --project="$PROJECT" --role=roles/iam.workloadIdentityUser --member="$member" --condition=None --quiet >/dev/null
 done
 
-for account in iyi-proxy iyi-sum iyi-newsletter iyi-probe; do
+for account in iyi-proxy iyi-sum iyi-probe; do
   gcloud iam service-accounts add-iam-policy-binding "${account}@${PROJECT}.iam.gserviceaccount.com" \
     --project="$PROJECT" --role=roles/iam.serviceAccountUser --member="serviceAccount:${tf_email}" --condition=None --quiet >/dev/null
 done
-for pair in 'iyi-proxy:iyi-modproxy-deployer' 'iyi-sum:iyi-modproxy-deployer' 'iyi-newsletter:iyi-newsletter-deployer'; do
+for pair in 'iyi-proxy:iyi-modproxy-deployer' 'iyi-sum:iyi-modproxy-deployer'; do
   runtime=${pair%%:*}; deployer=${pair#*:}
   gcloud iam service-accounts add-iam-policy-binding "${runtime}@${PROJECT}.iam.gserviceaccount.com" \
     --project="$PROJECT" --role=roles/iam.serviceAccountUser \

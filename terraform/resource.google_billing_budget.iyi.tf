@@ -9,7 +9,6 @@ resource "google_billing_budget" "iyi" {
 
   budget_filter {
     projects        = ["projects/${data.google_project.current.number}"]
-    labels          = { stack = "iyi" }
     calendar_period = "MONTH"
   }
 

@@ -10,7 +10,6 @@ Each site has two Firebase Hosting hostnames:
 | --- | --- |
 | Proxy | `https://iyi-proxy.web.app`, `https://iyi-proxy.firebaseapp.com` |
 | Checksum service | `https://iyi-sum.web.app`, `https://iyi-sum.firebaseapp.com` |
-| Newsletter | `https://iyi-newsletter.web.app`, `https://iyi-newsletter.firebaseapp.com` |
 | Probe | `https://iyi-probe.web.app`, `https://iyi-probe.firebaseapp.com` |
 
 Keep responses on both hostnames for every site marked `noindex` while they are temporary. An `X-Robots-Tag: noindex` response header can cover non-HTML responses as well as pages. Do not rely on a `robots.txt` block as a substitute: a crawler must be able to read the response to see its `noindex` instruction.
@@ -34,7 +33,6 @@ Set the `public_base_urls` input for each service to its intended public origin.
 
 - Canonical links and sitemap URLs point to the permanent hostname.
 - Open Graph URLs point to the permanent hostname.
-- Newsletter verification, unsubscribe, and other email links point to the permanent hostname.
 - Client and release configuration uses the intended proxy and checksum endpoints.
 
 The proxy and checksum URLs are transport endpoints; changing them does not change module identity or the identity recorded in `iyi.sum`. Do not rewrite module paths or checksum identity merely because a service hostname changes.
@@ -49,6 +47,3 @@ This configuration creates no production signing key, checkpoint, or log before 
 
 `production_namespace_ready` defaults to `false`. Setting it to `true` requires a key name, creates an empty production secret container and a separate private bucket, and configures the checksum service to use them. It does not generate a production key or publish a checkpoint. The staging Ed25519 key is generated separately and stored in Secret Manager and Terraform state. Keep state access restricted and never use the staging identity in production.
 
-## Newsletter delivery
-
-Real subscriber mail requires a verified sending domain with the mail provider, such as Resend, and a working permanent public base URL. Do not send real subscribers links to either temporary Firebase hostname. Exercise delivery changes in a provider sandbox or application test mode rather than creating test messages for real subscribers.

@@ -1,8 +1,7 @@
 # iyi infrastructure
 
-Infrastructure configuration for the iyi package stack: the package proxy,
-checksum service, newsletter, and probe. The configuration describes intended
-resources; it is not a record of deployed services.
+Infrastructure configuration for the iyi module proxy, checksum service, and
+probe. The configuration describes intended resources, not deployed services.
 
 ## Local checks
 
@@ -23,8 +22,8 @@ also covers optional ShellCheck and actionlint checks and the pull request proce
 Cloud access and deployment are separate from local validation. Maintainers
 review infrastructure changes and use CI for plans and applies. Do not commit
 credentials, signing keys, Terraform state, or billing account identifiers.
-The [cutover guide](docs/CUTOVER.md) describes the requirements for domains,
-checksum identity, and newsletter delivery.
+The [cutover guide](docs/CUTOVER.md) describes the requirements for domains
+and checksum identity.
 
 `bootstrap/bootstrap.sh --check` reads the configured project's trust-anchor
 metadata. The script's mutating mode is for an approved CI environment, not a

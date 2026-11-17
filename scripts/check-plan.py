@@ -13,6 +13,7 @@ ALLOWED = {
     "google_firebase_hosting_site",
     "google_firebase_hosting_version",
     "google_logging_project_exclusion",
+    "google_project_service",
     "google_secret_manager_secret",
     "google_secret_manager_secret_iam_member",
     "google_secret_manager_secret_version",
@@ -39,8 +40,17 @@ def check(plan):
                 errors.append(f"{address}: service is outside the iyi namespace")
         if resource["type"] == "google_firebase_hosting_site":
             name = (resource["change"].get("after") or {}).get("site_id", "")
-            if name not in {"iyi-proxy", "iyi-sum", "iyi-newsletter", "iyi-probe"}:
+            if name not in {"iyi-proxy", "iyi-sum", "iyi-probe"}:
                 errors.append(f"{address}: unexpected Hosting site")
+        if resource["type"] == "google_project_service":
+            after = resource["change"].get("after") or {}
+            services = {
+                "run.googleapis.com", "artifactregistry.googleapis.com", "iam.googleapis.com",
+                "iamcredentials.googleapis.com", "secretmanager.googleapis.com", "sts.googleapis.com",
+                "cloudbilling.googleapis.com", "billingbudgets.googleapis.com",
+            }
+            if after.get("project") != "iyi-lang" or after.get("service") not in services:
+                errors.append(f"{address}: API or project is outside the intended scope")
     return errors
 
 

@@ -36,7 +36,6 @@ jobs:
       TF_VAR_billing_account: ${{ secrets.IYI_BILLING_ACCOUNT }}
       TF_VAR_service_images: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
       TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
-      TF_VAR_newsletter_database_secret_id: ${{ vars.IYI_NEWSLETTER_DATABASE_SECRET_ID || '' }}
       TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
       TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
       TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
@@ -71,11 +70,10 @@ jobs:
       TF_VAR_billing_account: ${{ secrets.IYI_BILLING_ACCOUNT }}
       TF_VAR_service_images: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
       TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
-      TF_VAR_newsletter_database_secret_id: ${{ vars.IYI_NEWSLETTER_DATABASE_SECRET_ID || '' }}
       TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
       TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
       TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
-      IYI_PROJECT_ID: ${{ vars.IYI_PROJECT_ID || 'crystalshards-org' }}
+      IYI_PROJECT_ID: ${{ vars.IYI_PROJECT_ID || 'iyi-lang' }}
     steps:
       - uses: actions/checkout@v4
       - uses: google-github-actions/auth@v2

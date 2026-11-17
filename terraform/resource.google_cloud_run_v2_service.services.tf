@@ -32,19 +32,6 @@ resource "google_cloud_run_v2_service" "services" {
       }
 
       dynamic "env" {
-        for_each = each.key == "iyi-newsletter" ? [var.newsletter_database_secret_id] : []
-        content {
-          name = "DATABASE_URL"
-          value_source {
-            secret_key_ref {
-              secret  = env.value
-              version = "latest"
-            }
-          }
-        }
-      }
-
-      dynamic "env" {
         for_each = each.key == "iyi-sum" ? [1] : []
         content {
           name  = "SUMDB_KEY_NAME"
@@ -84,7 +71,6 @@ resource "google_cloud_run_v2_service" "services" {
     google_secret_manager_secret_version.sum_staging,
     google_secret_manager_secret_iam_member.sum_staging,
     google_secret_manager_secret_iam_member.sum_production,
-    google_secret_manager_secret_iam_member.newsletter,
   ]
 }
 

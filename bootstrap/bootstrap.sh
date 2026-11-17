@@ -82,6 +82,13 @@ print_command() {
   printf '\n'
 }
 
+# Mark reads separately from possible mutations in the offline preview.
+print_read_command() {
+  printf '  ?'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
 mutate() {
   if [[ "$MODE" == dry-run ]]; then print_command "$@" --quiet; else "$@" --quiet; fi
 }
@@ -124,6 +131,7 @@ ensure_resource() {
   PRESENT=0
   CREATED=0
   if [[ "$MODE" == dry-run ]]; then
+    print_read_command "${read_command[@]}"
     printf 'If %s is absent:\n' "$label"
     mutate "${create_command[@]}"
     PRESENT=1
@@ -148,14 +156,14 @@ ensure_bucket() {
   ensure_resource "bucket gs://${name}" \
     gcloud storage buckets describe "gs://${name}" --project="$PROJECT" --raw --format=json -- \
     gcloud storage buckets create "gs://${name}" --project="$PROJECT" --location="$REGION" \
-      --uniform-bucket-level-access --public-access-prevention --labels="$OWNER_LABELS"
+      --uniform-bucket-level-access --public-access-prevention
   ((PRESENT)) || return 0
   if [[ "$MODE" != dry-run && "$CREATED" == 0 ]]; then
     if ! jq -e --arg project "$PROJECT_NUMBER" --arg region "$REGION" \
       '(.projectNumber | tostring) == $project and (.location | ascii_downcase) == $region and
        .labels.stack == "iyi" and .labels.managed_by == "iyi_infra"' \
       <<<"$DESCRIPTION" >/dev/null; then
-      drift "gs://${name} has the wrong project, region, or ownership labels; refusing adoption"
+      drift "gs://${name} has the wrong project, region, or ownership labels; refusing adoption. If creation was interrupted, verify the bucket's provenance before adding ownership labels."
       PRESENT=0
       return 0
     fi
@@ -166,7 +174,7 @@ ensure_bucket() {
   fi
   printf 'If gs://%s was created or its protections need repair:\n' "$name"
   mutate gcloud storage buckets update "gs://${name}" --project="$PROJECT" \
-    --uniform-bucket-level-access --public-access-prevention --versioning
+    --uniform-bucket-level-access --public-access-prevention --versioning --update-labels="$OWNER_LABELS"
 }
 
 ensure_registry_cleanup() {
@@ -245,6 +253,7 @@ ensure_binding() {
   shift
   add_command=("$@")
   if [[ "$MODE" == dry-run ]]; then
+    print_read_command "${read_command[@]}"
     printf 'If binding is absent on %s:\n' "$label"
     mutate "${add_command[@]}" --member="$member" --role="$role"
     return 0
@@ -301,14 +310,32 @@ secret_binding() {
 }
 
 ensure_budget() {
-  local result
+  local result budget_account=$BILLING_ACCOUNT arg
+  if [[ "$MODE" == dry-run ]]; then budget_account="\${IYI_BILLING_ACCOUNT}"; fi
+  local -a list_command=(gcloud billing budgets list --billing-account="$budget_account" \
+    --billing-project="$PROJECT" --format=json --quiet)
+  local -a create_command=(gcloud billing budgets create --billing-account="$budget_account" \
+    --billing-project="$PROJECT" --display-name="$BUDGET_NAME" --budget-amount=200USD \
+    --calendar-period=month --filter-projects="projects/${PROJECT_NUMBER}" \
+    "--threshold-rule=percent=0.5,basis=current-spend" \
+    "--threshold-rule=percent=0.9,basis=current-spend" \
+    "--threshold-rule=percent=1.0,basis=current-spend" --quiet)
   echo 'Human review only, not run: update a verified budget ID after inspecting all mismatched settings.'
   printf '%s\n' "CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true gcloud billing budgets update \"\${BUDGET_ID}\" --billing-account=\"\${IYI_BILLING_ACCOUNT}\" --billing-project=iyi-lang --budget-amount=200USD --calendar-period=month --filter-projects=projects/477913052471 --quiet >/dev/null 2>&1"
   echo 'Threshold mismatches require the console or a separately reviewed --threshold-rules-from-file update.'
   echo 'The template does not clear other filters, Pub/Sub, spend caps, extra recipients, or re-enable disabled default recipients.'
   if [[ "$MODE" == dry-run ]]; then
+    print_read_command "${list_command[@]}"
     echo 'If the single-project budget is absent and no same-name budget exists:'
-    printf '%s\n' "CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true gcloud billing budgets create --billing-account=\"\${IYI_BILLING_ACCOUNT}\" --billing-project=iyi-lang --display-name=\"iyi-lang monthly alert\" --budget-amount=200USD --calendar-period=month --filter-projects=projects/477913052471 --threshold-rule=percent=0.5,basis=current-spend --threshold-rule=percent=0.9,basis=current-spend --threshold-rule=percent=1.0,basis=current-spend --quiet >/dev/null 2>&1"
+    printf 'CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true'
+    for arg in "${create_command[@]}"; do
+      if [[ "$arg" == "--billing-account=\${IYI_BILLING_ACCOUNT}" ]]; then
+        printf ' --billing-account="%s"' "\${IYI_BILLING_ACCOUNT}"
+      else
+        printf ' %q' "$arg"
+      fi
+    done
+    printf ' >/dev/null 2>&1\n'
     echo 'Duplicate or incompatible same-name budgets stop bootstrap; none are updated or deleted automatically.'
     return 0
   fi
@@ -318,8 +345,7 @@ ensure_budget() {
   fi
   # gcloud's result is piped directly to jq; only fixed field names and status
   # leave the pipe. Never print its output or stderr, which can contain the ID.
-  if ! result=$(gcloud billing budgets list --billing-account="$BILLING_ACCOUNT" \
-    --billing-project="$PROJECT" --format=json --quiet 2>/dev/null |
+  if ! result=$("${list_command[@]}" 2>/dev/null |
     jq -er --arg name "$BUDGET_NAME" --arg project "projects/${PROJECT_NUMBER}" '
       [.[] | select(.displayName == $name)] as $matches |
       if ($matches | length) == 0 then "ABSENT"
@@ -370,11 +396,7 @@ ensure_budget() {
       if [[ "$MODE" == check ]]; then
         echo 'Budget: ABSENT'
         STATUS=1
-      elif ! gcloud billing budgets create --billing-account="$BILLING_ACCOUNT" --billing-project="$PROJECT" \
-        --display-name="$BUDGET_NAME" --budget-amount=200USD --calendar-period=month \
-        --filter-projects="projects/${PROJECT_NUMBER}" --threshold-rule=percent=0.5,basis=current-spend \
-        --threshold-rule=percent=0.9,basis=current-spend --threshold-rule=percent=1.0,basis=current-spend \
-        --quiet >/dev/null 2>&1; then
+      elif ! "${create_command[@]}" >/dev/null 2>&1; then
         echo 'Budget: CREATE FAILED. Check human budget-create access and the account currency; the account is withheld.' >&2
         exit 1
       else
@@ -384,6 +406,12 @@ ensure_budget() {
     *) echo 'Budget: UNREADABLE (unexpected sanitized result)' >&2; exit 1 ;;
   esac
 }
+
+config_command=(gcloud config list --format=json --quiet)
+active_account_command=(gcloud auth list --filter=status:ACTIVE --format='value(account)' --quiet)
+access_token_command=(gcloud auth print-access-token --quiet)
+project_command=(gcloud projects describe "$PROJECT" --format='value(projectNumber)' --quiet)
+services_command=(gcloud services list --enabled --project="$PROJECT" --format='value(config.name)' --quiet)
 
 if [[ "$MODE" != dry-run ]]; then
   for executable in gcloud jq grep; do
@@ -403,28 +431,34 @@ if [[ "$MODE" != dry-run ]]; then
   done
   export CLOUDSDK_CORE_DISABLE_PROMPTS=1
   export CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true
-  config=$(gcloud config list --format=json --quiet)
+  config=$("${config_command[@]}")
   if jq -e '(.auth.credential_file_override // "") != "" or
     (.auth.impersonate_service_account // "") != "" or (.auth.access_token_file // "") != ""' \
     <<<"$config" >/dev/null; then
     echo 'Refusing configured gcloud credential-file, token-file, or service-account impersonation override.' >&2
     exit 1
   fi
-  active_account=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' --quiet)
+  active_account=$("${active_account_command[@]}")
   if [[ -z "$active_account" || "$active_account" == *gserviceaccount.com* ]]; then
     echo 'No active human gcloud CLI login. Run gcloud auth login interactively, then retry; ADC is not used.' >&2
     exit 1
   fi
-  if ! gcloud auth print-access-token --quiet >/dev/null 2>&1; then
+  if ! "${access_token_command[@]}" >/dev/null 2>&1; then
     echo 'The active gcloud CLI login is expired or cannot refresh. Run gcloud auth login interactively, then retry; ADC is not used.' >&2
     exit 1
   fi
-  actual_number=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)' --quiet)
+  actual_number=$("${project_command[@]}")
   if [[ "$actual_number" != "$PROJECT_NUMBER" ]]; then
     printf 'Project number mismatch: expected %s, received %s; refusing to proceed.\n' "$PROJECT_NUMBER" "$actual_number" >&2
     exit 1
   fi
-  enabled=$(gcloud services list --enabled --project="$PROJECT" --format='value(config.name)' --quiet)
+  enabled=$("${services_command[@]}")
+else
+  print_read_command "${config_command[@]}"
+  print_read_command "${active_account_command[@]}"
+  print_read_command "${access_token_command[@]}"
+  print_read_command "${project_command[@]}"
+  print_read_command "${services_command[@]}"
 fi
 
 for api in "${APIS[@]}"; do
@@ -453,12 +487,15 @@ if ((pool_present)) && [[ "$MODE" != dry-run && "$CREATED" == 0 ]]; then
     <<<"$DESCRIPTION" >/dev/null || drift "workload identity pool is inactive or lacks its ownership marker"
 fi
 
+providers_command=(gcloud iam workload-identity-pools providers list --workload-identity-pool="$POOL" \
+  --location=global --project="$PROJECT" --format=json --quiet)
+
 if ((pool_present)); then
   if [[ "$MODE" == dry-run ]]; then
+    print_read_command "${providers_command[@]}"
     printf 'Precondition: pool %s in project %s must contain no active provider except %s; other providers are never deleted.\n' "$POOL" "$PROJECT" "$PROVIDER"
   else
-    if ! providers=$(gcloud iam workload-identity-pools providers list --workload-identity-pool="$POOL" \
-      --location=global --project="$PROJECT" --format=json --quiet 2>&1); then
+    if ! providers=$("${providers_command[@]}" 2>&1); then
       printf 'UNREADABLE workload identity providers in %s: %s\n' "$POOL" "$providers" >&2
       exit 1
     fi
@@ -502,10 +539,12 @@ if ((deployer_present)); then
     jq -e --arg marker "$OWNER_MARKER" '.disabled != true and .description == $marker' \
       <<<"$DESCRIPTION" >/dev/null || drift "service account ${DEPLOYER} is disabled or lacks its ownership marker"
   fi
+  deployer_policy_command=(gcloud iam service-accounts get-iam-policy "$DEPLOYER" --project="$PROJECT" --format=json --quiet)
   if [[ "$MODE" == dry-run ]]; then
+    print_read_command "${deployer_policy_command[@]}"
     echo 'Existing workloadIdentityUser bindings on the deployer must contain only the push principal, unconditionally.'
   else
-    policy=$(gcloud iam service-accounts get-iam-policy "$DEPLOYER" --project="$PROJECT" --format=json --quiet)
+    policy=$("${deployer_policy_command[@]}")
     if ! jq -e --arg member "$PUSH_MEMBER" \
       'all(.bindings[]? | select(.role == "roles/iam.workloadIdentityUser" or (.role | startswith("roles/iam.workloadIdentityUser_withcond_")));
         .role == "roles/iam.workloadIdentityUser" and .condition == null and all(.members[]?; . == $member))' \

@@ -45,5 +45,8 @@ Until production is ready, use only the clearly named staging key and a staging 
 
 This configuration creates no production signing key, checkpoint, or log before namespace readiness. A maintainer must explicitly choose the production signing key name before signing the first production checkpoint. The key name cannot change after a production checkpoint has been published. A later proxy or checksum URL change does not change that signing identity.
 
-`production_namespace_ready` defaults to `false`. Setting it to `true` requires a key name, creates an empty production secret container and a separate private bucket, and configures the checksum service to use them. It does not generate a production key or publish a checkpoint. The staging Ed25519 key is generated separately and stored in Secret Manager and Terraform state. Keep state access restricted and never use the staging identity in production.
+`production_namespace_ready` defaults to `false`. A production cutover requires a chosen key name and separately provisioned production storage and secret resources. The flag does not generate a production key or publish a checkpoint. Keep staging and production identities separate.
+
+The main-branch CI job generates and validates the staging key in memory,
+then sends it directly to Secret Manager. Terraform does not handle the key.
 

@@ -4,6 +4,10 @@ resource "google_firebase_hosting_site" "sites" {
   project         = var.project_id
   site_id         = each.value
   deletion_policy = "PREVENT"
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "google_firebase_hosting_custom_domain" "sites" {

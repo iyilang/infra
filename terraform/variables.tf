@@ -16,15 +16,8 @@ variable "region" {
   default     = "us-central1"
 }
 
-variable "billing_account" {
-  description = "Cloud Billing account ID, supplied by the maintainers rather than committed."
-  type        = string
-  sensitive   = true
-  nullable    = false
-}
-
 variable "service_images" {
-  description = "Published container image for each enabled Cloud Run service. No bootstrap image is assumed."
+  description = "Published container images keyed by Cloud Run service or job name. Omitted or empty entries are not deployed."
   type        = map(string)
   nullable    = false
   default     = {}
@@ -54,7 +47,7 @@ variable "production_sumdb_key_name" {
   type        = string
   default     = ""
   validation {
-    condition     = !var.production_namespace_ready || var.production_sumdb_key_name != ""
+    condition     = !var.production_namespace_ready || length(trimspace(var.production_sumdb_key_name)) > 0
     error_message = "Choose the permanent production sumdb key name before enabling the production namespace."
   }
 }

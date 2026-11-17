@@ -43,6 +43,8 @@ STATUS=0
 PRESENT=0
 CREATED=0
 DESCRIPTION=
+CAPTURED=
+CAPTURE_ERROR=
 
 usage() {
   printf '%s\n' 'Usage: bootstrap.sh [--check | --dry-run | --apply] [--billing-account ACCOUNT]' \
@@ -99,23 +101,67 @@ drift() {
   STATUS=1
 }
 
+# Keep diagnostics out of JSON while preserving the error needed to classify
+# a missing resource. Never treat an unreadable response as absence.
+capture_output() {
+  local error_file rc
+  CAPTURED=
+  CAPTURE_ERROR=
+  error_file=$(mktemp "${TMPDIR:-/tmp}/iyi-bootstrap-stderr.XXXXXXXX") || return 1
+  if CAPTURED=$("$@" 2>"$error_file"); then
+    if [[ -s "$error_file" ]]; then cat "$error_file" >&2; fi
+    rm -f -- "$error_file"
+    return 0
+  else
+    rc=$?
+    CAPTURE_ERROR=$(cat "$error_file")
+    if [[ -n "$CAPTURED" ]]; then CAPTURE_ERROR="${CAPTURE_ERROR}"$'\n'"${CAPTURED}"; fi
+    rm -f -- "$error_file"
+    return "$rc"
+  fi
+}
+
+require_json() {
+  local label=$1 expected=$2 data=$3
+  if ! jq -e -s --arg expected "$expected" \
+    'length == 1 and (.[0] | type == $expected)' <<<"$data" >/dev/null 2>&1; then
+    printf '%s: UNREADABLE (expected a single JSON %s)\n' "$label" "$expected" >&2
+    return 1
+  fi
+}
+
+require_iam_policy() {
+  local label=$1 policy=$2
+  require_json "$label" object "$policy" || return 1
+  if ! jq -e '(if has("bindings") then (.bindings | type == "array") else true end) and
+    all(.bindings[]?; type == "object" and (.role | type == "string") and
+      (.members | type == "array") and all(.members[]?; type == "string"))' \
+    <<<"$policy" >/dev/null 2>&1; then
+    printf '%s: UNREADABLE (invalid IAM policy bindings)\n' "$label" >&2
+    return 1
+  fi
+}
+
 # Only explicit not-found errors are absence. A 403 or ambiguous error is not.
 describe() {
   local label=$1
   shift
-  if DESCRIPTION=$("$@" 2>&1); then
+  if capture_output "$@"; then
+    DESCRIPTION=$CAPTURED
+    require_json "$label" object "$DESCRIPTION" || return 2
     printf '%s: PRESENT\n' "$label"
     return 0
   fi
-  if printf '%s\n' "$DESCRIPTION" | grep -Eiq 'PERMISSION_DENIED|permission|forbidden|unauthori[sz]ed|credential|authentication|access.denied|(^|[^0-9])403([^0-9]|$)'; then
-    printf '%s: UNREADABLE (authorization or authentication error): %s\n' "$label" "$DESCRIPTION" >&2
+  DESCRIPTION=
+  if printf '%s\n' "$CAPTURE_ERROR" | grep -Eiq 'PERMISSION_DENIED|permission|forbidden|unauthori[sz]ed|credential|authentication|access.denied|(^|[^0-9])403([^0-9]|$)'; then
+    printf '%s: UNREADABLE (authorization or authentication error): %s\n' "$label" "$CAPTURE_ERROR" >&2
     return 2
   fi
-  if printf '%s\n' "$DESCRIPTION" | grep -Eiq 'NOT_FOUND|not found|does not exist|(^|[^0-9])404([^0-9]|$)'; then
+  if printf '%s\n' "$CAPTURE_ERROR" | grep -Eiq 'NOT_FOUND|not found|does not exist|(^|[^0-9])404([^0-9]|$)'; then
     printf '%s: ABSENT\n' "$label"
     return 1
   fi
-  printf '%s: UNREADABLE: %s\n' "$label" "$DESCRIPTION" >&2
+  printf '%s: UNREADABLE: %s\n' "$label" "$CAPTURE_ERROR" >&2
   return 2
 }
 
@@ -258,10 +304,12 @@ ensure_binding() {
     mutate "${add_command[@]}" --member="$member" --role="$role"
     return 0
   fi
-  if ! policy=$("${read_command[@]}" 2>&1); then
-    printf 'UNREADABLE IAM policy on %s: %s\n' "$label" "$policy" >&2
+  if ! capture_output "${read_command[@]}"; then
+    printf 'UNREADABLE IAM policy on %s: %s\n' "$label" "$CAPTURE_ERROR" >&2
     exit 1
   fi
+  policy=$CAPTURED
+  require_iam_policy "IAM policy on ${label}" "$policy" || exit 1
   if jq -e --arg member "$member" --arg role "$role" \
     '[.bindings[]? | select(.role == $role and .condition == null) | .members[]?] | index($member) != null' \
     <<<"$policy" >/dev/null; then
@@ -432,6 +480,11 @@ if [[ "$MODE" != dry-run ]]; then
   export CLOUDSDK_CORE_DISABLE_PROMPTS=1
   export CLOUDSDK_CORE_DISABLE_FILE_LOGGING=true
   config=$("${config_command[@]}")
+  require_json 'gcloud configuration' object "$config" || exit 1
+  if ! jq -e '.auth == null or (.auth | type == "object")' <<<"$config" >/dev/null 2>&1; then
+    echo 'gcloud configuration: UNREADABLE (invalid auth section)' >&2
+    exit 1
+  fi
   if jq -e '(.auth.credential_file_override // "") != "" or
     (.auth.impersonate_service_account // "") != "" or (.auth.access_token_file // "") != ""' \
     <<<"$config" >/dev/null; then
@@ -495,10 +548,12 @@ if ((pool_present)); then
     print_read_command "${providers_command[@]}"
     printf 'Precondition: pool %s in project %s must contain no active provider except %s; other providers are never deleted.\n' "$POOL" "$PROJECT" "$PROVIDER"
   else
-    if ! providers=$("${providers_command[@]}" 2>&1); then
-      printf 'UNREADABLE workload identity providers in %s: %s\n' "$POOL" "$providers" >&2
+    if ! capture_output "${providers_command[@]}"; then
+      printf 'UNREADABLE workload identity providers in %s: %s\n' "$POOL" "$CAPTURE_ERROR" >&2
       exit 1
     fi
+    providers=$CAPTURED
+    require_json "workload identity providers in ${POOL}" array "$providers" || exit 1
     if ! jq -e --arg provider "$PROVIDER_NAME" \
       'all(.[]; .disabled == true or .state == "DELETED" or (.state == "ACTIVE" and .name == $provider))' \
       <<<"$providers" >/dev/null; then
@@ -545,6 +600,7 @@ if ((deployer_present)); then
     echo 'Existing workloadIdentityUser bindings on the deployer must contain only the push principal, unconditionally.'
   else
     policy=$("${deployer_policy_command[@]}")
+    require_iam_policy "IAM policy on service account ${DEPLOYER}" "$policy" || exit 1
     if ! jq -e --arg member "$PUSH_MEMBER" \
       'all(.bindings[]? | select(.role == "roles/iam.workloadIdentityUser" or (.role | startswith("roles/iam.workloadIdentityUser_withcond_")));
         .role == "roles/iam.workloadIdentityUser" and .condition == null and all(.members[]?; . == $member))' \
@@ -661,4 +717,11 @@ API enablement, Cloud Run creation/updates, and log exclusions are project-wide.
 Deploying code as the individually authorized runtime identities can exercise their data and staging-key access.
 PR access to state may expose any sensitive values stored there. Existing and inherited IAM grants are not audited.
 EOF
+if [[ "$MODE" == check ]]; then
+  if ((STATUS == 0)); then
+    echo 'Bootstrap check: all required resources are present and compatible.'
+  else
+    echo 'Bootstrap check: one or more resources are missing or incompatible.' >&2
+  fi
+fi
 exit "$STATUS"

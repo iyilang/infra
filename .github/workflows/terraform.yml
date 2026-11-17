@@ -33,6 +33,7 @@ jobs:
           python3 scripts/test-plan-gate.py
           python3 scripts/test-workflow-gate.py
           python3 scripts/check-bootstrap-gcloud-help.py
+          python3 scripts/test-bootstrap-check.py
           shellcheck bootstrap/bootstrap.sh scripts/deploy.sh scripts/set-hosting-retention.sh
 
   plan:

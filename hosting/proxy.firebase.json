@@ -1,0 +1,11 @@
+{
+  "hosting": {
+    "site": "iyi-proxy",
+    "public": "empty",
+    "headers": [
+      {"source": "/", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]},
+      {"source": "**", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]}
+    ],
+    "rewrites": [{"source": "**", "run": {"serviceId": "iyi-proxy", "region": "us-central1"}}]
+  }
+}

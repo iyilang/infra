@@ -1,0 +1,345 @@
+name: Terraform
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: 'true'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+        with:
+          version: '580.0.0'
+      - name: Validate without cloud credentials
+        run: |
+          terraform -chdir=terraform fmt -check -recursive
+          terraform -chdir=terraform init -backend=false -input=false
+          terraform -chdir=terraform validate
+          python3 scripts/test-plan-gate.py
+          python3 scripts/test-workflow-gate.py
+          python3 scripts/check-bootstrap-gcloud-help.py
+          python3 scripts/test-bootstrap-check.py
+          shellcheck bootstrap/bootstrap.sh scripts/deploy.sh scripts/set-hosting-retention.sh
+
+  plan:
+    if: ${{ github.repository == 'iyilang/infra' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      IYI_WIF_PROVIDER: ${{ vars.IYI_WIF_PROVIDER }}
+      IYI_SERVICE_IMAGES: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
+      TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
+      TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
+      TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
+      TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check plan prerequisites
+        id: prerequisites
+        run: |
+          provider_status=ok
+          expected=projects/477913052471/locations/global/workloadIdentityPools/iyi-github/providers/github
+          if [[ -z "$IYI_WIF_PROVIDER" ]]; then
+            provider_status=missing
+            echo '::error::IYI_WIF_PROVIDER is missing. Configure the bootstrap provider repository variable.'
+          elif [[ "$IYI_WIF_PROVIDER" != "$expected" ]]; then
+            provider_status=invalid
+            echo '::error::IYI_WIF_PROVIDER does not identify the expected iyi-github/github bootstrap provider.'
+          fi
+          printf 'provider=%s\n' "$provider_status" >> "$GITHUB_OUTPUT"
+          [[ "$provider_status" == ok ]]
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        id: auth
+        with:
+          project_id: iyi-lang
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - name: Prepare planned images
+        run: |
+          [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Invalid pull request revision.'; exit 1; }
+          image="us-central1-docker.pkg.dev/iyi-lang/iyi/probe:$PR_HEAD_SHA"
+          if ! images=$(jq -ce --arg image "$image" '
+            if type == "object" and all(.[]; type == "string") then
+              . + {"iyi-probe-public": $image, "iyi-probe-internal": $image}
+            else error("invalid service images") end
+          ' <<<"$IYI_SERVICE_IMAGES" 2>"$RUNNER_TEMP/iyi-images-error.log"); then
+            echo '::error::IYI_SERVICE_IMAGES must be a JSON object of service names to image strings.'
+            exit 1
+          fi
+          printf 'TF_VAR_service_images=%s\n' "$images" >> "$GITHUB_ENV"
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        id: preinit_auth
+        with:
+          project_id: iyi-lang
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+      - name: Initialize and validate
+        run: |
+          if ! terraform -chdir=terraform init -input=false -no-color >"$RUNNER_TEMP/iyi-init.log" 2>&1; then
+            echo '::error::Terraform initialization failed. Check the bootstrap state bucket and plan identity access.'
+            exit 1
+          fi
+          if ! terraform -chdir=terraform validate -no-color >"$RUNNER_TEMP/iyi-validate.log" 2>&1; then
+            echo '::error::Terraform validation failed. See the credential-free validation job for details.'
+            exit 1
+          fi
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        id: plan_auth
+        with:
+          project_id: iyi-lang
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+      - name: Create plan
+        run: |
+          if ! terraform -chdir=terraform plan -input=false -lock=false -no-color -out="$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.log" 2>&1; then
+            echo '::error::Terraform plan failed. Check the read-only identity, state access and Terraform configuration.'
+            exit 1
+          fi
+          if ! terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.json" 2>"$RUNNER_TEMP/iyi-show.log"; then
+            echo '::error::Terraform could not read the saved plan.'
+            exit 1
+          fi
+      - name: Check plan policy
+        id: gate
+        run: |
+          status=0
+          python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json" >"$RUNNER_TEMP/iyi-summary.txt" 2>"$RUNNER_TEMP/iyi-gate-errors.log" || status=$?
+          summary=$(<"$RUNNER_TEMP/iyi-summary.txt")
+          printf 'summary=%s\n' "$summary" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$summary"
+          cat "$RUNNER_TEMP/iyi-gate-errors.log" >&2
+          exit "$status"
+      - name: Comment plan verdict
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROVIDER_STATUS: ${{ steps.prerequisites.outputs.provider }}
+          AUTH_OUTCOME: ${{ steps.auth.outcome }}
+          PREINIT_AUTH_OUTCOME: ${{ steps.preinit_auth.outcome }}
+          PLAN_AUTH_OUTCOME: ${{ steps.plan_auth.outcome }}
+          PLAN_SUMMARY: ${{ steps.gate.outputs.summary }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo 'Invalid pull request number.' >&2; exit 1; }
+          if [[ "$PROVIDER_STATUS" == missing || "$PROVIDER_STATUS" == invalid ]]; then
+            message='Terraform plan blocked:'
+            if [[ "$PROVIDER_STATUS" == missing ]]; then
+              message+=' IYI_WIF_PROVIDER is missing.'
+            elif [[ "$PROVIDER_STATUS" == invalid ]]; then
+              message+=' IYI_WIF_PROVIDER does not name the expected bootstrap provider.'
+            fi
+          elif [[ "$AUTH_OUTCOME" == failure || "$PREINIT_AUTH_OUTCOME" == failure || "$PLAN_AUTH_OUTCOME" == failure ]]; then
+            message='Terraform plan blocked: WIF authentication failed. Check the bootstrap provider and plan identity grants.'
+          else
+            message=${PLAN_SUMMARY:-'Terraform plan blocked before the policy check. See the workflow run.'}
+          fi
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" -f body="$message" >/dev/null
+
+  apply:
+    if: ${{ github.repository == 'iyilang/infra' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: iyi-terraform-apply
+      cancel-in-progress: false
+    env:
+      IYI_WIF_PROVIDER: ${{ vars.IYI_WIF_PROVIDER }}
+      IYI_PROJECT_ID: ${{ vars.IYI_PROJECT_ID }}
+      IYI_DEPLOYER_SERVICE_ACCOUNT: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      IYI_SERVICE_IMAGES: ${{ vars.IYI_SERVICE_IMAGES || '{}' }}
+      TF_VAR_public_base_urls: ${{ vars.IYI_PUBLIC_BASE_URLS || '{}' }}
+      TF_VAR_custom_domains_enabled: ${{ vars.IYI_CUSTOM_DOMAINS_ENABLED || 'false' }}
+      TF_VAR_production_namespace_ready: ${{ vars.IYI_PRODUCTION_NAMESPACE_READY || 'false' }}
+      TF_VAR_production_sumdb_key_name: ${{ vars.IYI_PRODUCTION_SUMDB_KEY_NAME || '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check apply prerequisites
+        run: |
+          expected=projects/477913052471/locations/global/workloadIdentityPools/iyi-github/providers/github
+          [[ -n "$IYI_WIF_PROVIDER" ]] || { echo '::error::IYI_WIF_PROVIDER is missing. Configure the bootstrap provider repository variable.'; exit 1; }
+          [[ "$IYI_WIF_PROVIDER" == "$expected" ]] || { echo '::error::IYI_WIF_PROVIDER does not identify the expected bootstrap provider.'; exit 1; }
+          [[ "$IYI_PROJECT_ID" == iyi-lang ]] || { echo '::error::IYI_PROJECT_ID must be set to iyi-lang.'; exit 1; }
+          [[ "$IYI_DEPLOYER_SERVICE_ACCOUNT" == iyi-deployer@iyi-lang.iam.gserviceaccount.com ]] || { echo '::error::IYI_DEPLOYER_SERVICE_ACCOUNT must name the bootstrap deployer.'; exit 1; }
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Invalid push revision.'; exit 1; }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]] || { echo '::error::Invalid GitHub run identity.'; exit 1; }
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: '1.15.8'
+          terraform_wrapper: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Prepare pinned Firebase CLI
+        run: npx --yes firebase-tools@15.36.0 --version >/dev/null
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Ensure staging signing key exists
+        run: |
+          set -o pipefail
+          secret=iyi-sum-staging-signing-key
+          if ! enabled=$(gcloud secrets versions list "$secret" --project="$IYI_PROJECT_ID" --filter='state=ENABLED' --format='value(name)' 2>"$RUNNER_TEMP/iyi-staging-key-list-error.log"); then
+            echo '::error::Cannot list staging signing key versions. Check the bootstrap secret and deployer access.'
+            exit 1
+          fi
+          if [[ -n "$enabled" ]]; then
+            echo 'An enabled staging signing key version already exists.'
+          else
+            if ! python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          try:
+              key = subprocess.run(
+                  ["openssl", "genpkey", "-algorithm", "ED25519"],
+                  check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+              ).stdout
+              subprocess.run(
+                  ["openssl", "pkey", "-check", "-noout"],
+                  input=key, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              )
+              gcloud_env = os.environ.copy()
+              gcloud_env["CLOUDSDK_CORE_DISABLE_FILE_LOGGING"] = "true"
+              gcloud_env["CLOUDSDK_CORE_LOG_HTTP"] = "false"
+              subprocess.run(
+                  ["gcloud", "secrets", "versions", "add", "iyi-sum-staging-signing-key",
+                   "--project=" + os.environ["IYI_PROJECT_ID"], "--data-file=-"],
+                  input=key, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  env=gcloud_env,
+              )
+          except (KeyError, OSError, subprocess.SubprocessError):
+              sys.exit(1)
+          PY
+            then
+              echo '::error::Cannot generate, validate or add the staging signing key version.'
+              exit 1
+            fi
+            echo 'Created a staging signing key version.'
+          fi
+      - name: Verify registry and build probe image
+        run: |
+          if ! gcloud artifacts repositories describe iyi --project="$IYI_PROJECT_ID" --location=us-central1 --format='value(name)' >"$RUNNER_TEMP/iyi-registry.log" 2>&1; then
+            echo '::error::Cannot read the iyi Artifact Registry repository. Check bootstrap and deployer access.'
+            exit 1
+          fi
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          image="us-central1-docker.pkg.dev/iyi-lang/iyi/probe:$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf 'PROBE_IMAGE_TAG=%s\n' "$image" >> "$GITHUB_ENV"
+          docker build --tag "$image" probe
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Push probe image
+        run: |
+          docker push "$PROBE_IMAGE_TAG"
+      - name: Prepare deployment images
+        run: |
+          if ! digest=$(gcloud artifacts docker images describe "$PROBE_IMAGE_TAG" --format='value(image_summary.digest)' 2>"$RUNNER_TEMP/iyi-digest-error.log"); then
+            echo '::error::Cannot resolve the pushed probe image digest. Check Artifact Registry reader access.'
+            exit 1
+          fi
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::Artifact Registry returned an invalid probe image digest.'; exit 1; }
+          image="us-central1-docker.pkg.dev/iyi-lang/iyi/probe@$digest"
+          if ! images=$(jq -ce --arg image "$image" '
+            if type == "object" and all(.[]; type == "string") then
+              . + {"iyi-probe-public": $image, "iyi-probe-internal": $image}
+            else error("invalid service images") end
+          ' <<<"$IYI_SERVICE_IMAGES" 2>"$RUNNER_TEMP/iyi-images-error.log"); then
+            echo '::error::IYI_SERVICE_IMAGES must be a JSON object of service names to image strings.'
+            exit 1
+          fi
+          printf 'TF_VAR_service_images=%s\n' "$images" >> "$GITHUB_ENV"
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Initialize and validate
+        run: |
+          if ! terraform -chdir=terraform init -input=false -no-color >"$RUNNER_TEMP/iyi-init.log" 2>&1; then
+            echo '::error::Terraform initialization failed. Check the bootstrap state bucket and deployer access.'
+            exit 1
+          fi
+          if ! terraform -chdir=terraform validate -no-color >"$RUNNER_TEMP/iyi-validate.log" 2>&1; then
+            echo '::error::Terraform validation failed. See the credential-free validation job for details.'
+            exit 1
+          fi
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Create and check plan
+        run: |
+          if ! terraform -chdir=terraform plan -input=false -no-color -out="$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.log" 2>&1; then
+            echo '::error::Terraform plan failed. Check deployer permissions, state access and Terraform configuration.'
+            exit 1
+          fi
+          if ! terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.json" 2>"$RUNNER_TEMP/iyi-show.log"; then
+            echo '::error::Terraform could not read the saved plan.'
+            exit 1
+          fi
+          python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json"
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Apply checked plan
+        run: |
+          if ! terraform -chdir=terraform apply -input=false -no-color "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-apply.log" 2>&1; then
+            echo '::error::Terraform apply failed. Check deployer permissions and the affected resources before retrying.'
+            exit 1
+          fi
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Deploy Hosting
+        run: bash scripts/deploy.sh
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ vars.IYI_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+          service_account: ${{ vars.IYI_DEPLOYER_SERVICE_ACCOUNT }}
+      - name: Limit retained Hosting versions
+        run: bash scripts/set-hosting-retention.sh

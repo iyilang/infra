@@ -1,0 +1,11 @@
+{
+  "hosting": {
+    "site": "iyi-sum",
+    "public": "empty",
+    "headers": [
+      {"source": "/", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]},
+      {"source": "**", "headers": [{"key": "X-Robots-Tag", "value": "noindex, nofollow"}]}
+    ],
+    "rewrites": [{"source": "**", "run": {"serviceId": "iyi-sum", "region": "us-central1"}}]
+  }
+}

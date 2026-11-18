@@ -73,6 +73,35 @@ require("terraform_wrapper: false" in plan and "terraform_wrapper: false" in app
         "Terraform wrapper must be disabled")
 require('-chdir=terraform plan -input=false -lock=false' in plan,
         "plan must use the read-only state path without a lock")
+
+# Every captured Terraform failure must print only its sanitized diagnostic.
+def checked_failure_logs(body, expected):
+    branches = re.findall(
+        r'(?ms)^[ \t]*if ! terraform -chdir=terraform (init|validate|plan|show|apply) '
+        r'[^\n]*>"\$RUNNER_TEMP/iyi-(init|validate|plan|show|apply)\.log"[^\n]*; then\n'
+        r'(.*?)(?=^[ \t]*fi[ \t]*$)', body)
+    return (len(branches) == len(expected) and {name for name, _, _ in branches} == set(expected) and
+            all(name == log and f'python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-{log}.log"' in branch
+                and "exit 1" in branch for name, log, branch in branches))
+
+
+require(checked_failure_logs(plan, ("init", "validate", "plan", "show")),
+        "every PR Terraform failure must print its sanitized diagnostic and fail")
+require(checked_failure_logs(apply, ("init", "validate", "plan", "show", "apply")),
+        "every apply Terraform failure must print its sanitized diagnostic and fail")
+require(not checked_failure_logs(plan.replace(
+    'python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-init.log"', "true", 1),
+    ("init", "validate", "plan", "show")), "failure-log guard must detect a missing sanitizer")
+require(not re.search(r'\b(?:cat|head|tail|tee|less)\b[^\n]*\$RUNNER_TEMP/iyi-(?:init|validate|plan|show|apply)\.log', workflow),
+        "raw Terraform diagnostic files must not be printed")
+require(not re.search(r'\b(?:cat|head|tail|tee|less)\b[^\n]*\$RUNNER_TEMP/iyi(?:-plan\.json|\.tfplan)', workflow),
+        "saved plans and JSON plans must not be printed")
+require("TF_LOG" not in workflow, "Terraform debug logging may expose credentials")
+require("python3 scripts/test-sanitized-log.py" in validate and "python3 scripts/test-terraform-state.py" in validate,
+        "credential-free validation must exercise log redaction and state preflight")
+require("python3 scripts/check-terraform-state.py" in plan and
+        "IYI_STATE_TOKEN: ${{ steps.preinit_auth.outputs.auth_token }}" in plan,
+        "PR state preflight must use the existing direct-WIF identity")
 for body in (plan, apply):
     require('IYI_WIF_PROVIDER is missing' in body,
             "missing provider must fail explicitly")

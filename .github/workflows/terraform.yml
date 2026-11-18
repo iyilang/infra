@@ -34,6 +34,8 @@ jobs:
           python3 scripts/test-workflow-gate.py
           python3 scripts/check-bootstrap-gcloud-help.py
           python3 scripts/test-bootstrap-check.py
+          python3 scripts/test-sanitized-log.py
+          python3 scripts/test-terraform-state.py
           shellcheck bootstrap/bootstrap.sh scripts/deploy.sh scripts/set-hosting-retention.sh
 
   plan:
@@ -88,6 +90,7 @@ jobs:
             else error("invalid service images") end
           ' <<<"$IYI_SERVICE_IMAGES" 2>"$RUNNER_TEMP/iyi-images-error.log"); then
             echo '::error::IYI_SERVICE_IMAGES must be a JSON object of service names to image strings.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-images-error.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
             exit 1
           fi
           printf 'TF_VAR_service_images=%s\n' "$images" >> "$GITHUB_ENV"
@@ -96,40 +99,58 @@ jobs:
         with:
           project_id: iyi-lang
           workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
+      - name: Check Terraform state
+        id: state
+        env:
+          IYI_STATE_TOKEN: ${{ steps.preinit_auth.outputs.auth_token }}
+        run: python3 scripts/check-terraform-state.py
       - name: Initialize and validate
+        if: ${{ steps.state.outputs.state == 'present' }}
         run: |
           if ! terraform -chdir=terraform init -input=false -no-color >"$RUNNER_TEMP/iyi-init.log" 2>&1; then
             echo '::error::Terraform initialization failed. Check the bootstrap state bucket and plan identity access.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-init.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
           if ! terraform -chdir=terraform validate -no-color >"$RUNNER_TEMP/iyi-validate.log" 2>&1; then
             echo '::error::Terraform validation failed. See the credential-free validation job for details.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-validate.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
       - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
         id: plan_auth
+        if: ${{ steps.state.outputs.state == 'present' }}
         with:
           project_id: iyi-lang
           workload_identity_provider: ${{ vars.IYI_WIF_PROVIDER }}
       - name: Create plan
+        if: ${{ steps.state.outputs.state == 'present' }}
         run: |
+          # The PR plan is advisory, and never applies its saved plan. Skipping
+          # the state lock avoids a write grant, but it may read a stale state
+          # while a main-branch apply runs.
           if ! terraform -chdir=terraform plan -input=false -lock=false -no-color -out="$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.log" 2>&1; then
             echo '::error::Terraform plan failed. Check the read-only identity, state access and Terraform configuration.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-plan.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
           if ! terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.json" 2>"$RUNNER_TEMP/iyi-show.log"; then
             echo '::error::Terraform could not read the saved plan.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-show.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
       - name: Check plan policy
         id: gate
+        if: ${{ steps.state.outputs.state == 'present' }}
         run: |
           status=0
           python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json" >"$RUNNER_TEMP/iyi-summary.txt" 2>"$RUNNER_TEMP/iyi-gate-errors.log" || status=$?
           summary=$(<"$RUNNER_TEMP/iyi-summary.txt")
           printf 'summary=%s\n' "$summary" >> "$GITHUB_OUTPUT"
           printf '%s\n' "$summary"
-          cat "$RUNNER_TEMP/iyi-gate-errors.log" >&2
+          if ((status != 0)); then
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-gate-errors.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
+          fi
           exit "$status"
       - name: Comment plan verdict
         if: ${{ always() }}
@@ -140,6 +161,7 @@ jobs:
           AUTH_OUTCOME: ${{ steps.auth.outcome }}
           PREINIT_AUTH_OUTCOME: ${{ steps.preinit_auth.outcome }}
           PLAN_AUTH_OUTCOME: ${{ steps.plan_auth.outcome }}
+          STATE_STATUS: ${{ steps.state.outputs.state }}
           PLAN_SUMMARY: ${{ steps.gate.outputs.summary }}
         run: |
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo 'Invalid pull request number.' >&2; exit 1; }
@@ -152,6 +174,8 @@ jobs:
             fi
           elif [[ "$AUTH_OUTCOME" == failure || "$PREINIT_AUTH_OUTCOME" == failure || "$PLAN_AUTH_OUTCOME" == failure ]]; then
             message='Terraform plan blocked: WIF authentication failed. Check the bootstrap provider and plan identity grants.'
+          elif [[ "$STATE_STATUS" == absent ]]; then
+            message='No Terraform state yet: the first apply on main creates it; PR plans work after that'
           else
             message=${PLAN_SUMMARY:-'Terraform plan blocked before the policy check. See the workflow run.'}
           fi
@@ -215,6 +239,7 @@ jobs:
           secret=iyi-sum-staging-signing-key
           if ! enabled=$(gcloud secrets versions list "$secret" --project="$IYI_PROJECT_ID" --filter='state=ENABLED' --format='value(name)' 2>"$RUNNER_TEMP/iyi-staging-key-list-error.log"); then
             echo '::error::Cannot list staging signing key versions. Check the bootstrap secret and deployer access.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-staging-key-list-error.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
             exit 1
           fi
           if [[ -n "$enabled" ]]; then
@@ -256,6 +281,7 @@ jobs:
         run: |
           if ! gcloud artifacts repositories describe iyi --project="$IYI_PROJECT_ID" --location=us-central1 --format='value(name)' >"$RUNNER_TEMP/iyi-registry.log" 2>&1; then
             echo '::error::Cannot read the iyi Artifact Registry repository. Check bootstrap and deployer access.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-registry.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
             exit 1
           fi
           gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
@@ -274,6 +300,7 @@ jobs:
         run: |
           if ! digest=$(gcloud artifacts docker images describe "$PROBE_IMAGE_TAG" --format='value(image_summary.digest)' 2>"$RUNNER_TEMP/iyi-digest-error.log"); then
             echo '::error::Cannot resolve the pushed probe image digest. Check Artifact Registry reader access.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-digest-error.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
             exit 1
           fi
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo '::error::Artifact Registry returned an invalid probe image digest.'; exit 1; }
@@ -284,6 +311,7 @@ jobs:
             else error("invalid service images") end
           ' <<<"$IYI_SERVICE_IMAGES" 2>"$RUNNER_TEMP/iyi-images-error.log"); then
             echo '::error::IYI_SERVICE_IMAGES must be a JSON object of service names to image strings.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-images-error.log" || echo 'Diagnostic output withheld: it could not be sanitized.'
             exit 1
           fi
           printf 'TF_VAR_service_images=%s\n' "$images" >> "$GITHUB_ENV"
@@ -296,10 +324,12 @@ jobs:
         run: |
           if ! terraform -chdir=terraform init -input=false -no-color >"$RUNNER_TEMP/iyi-init.log" 2>&1; then
             echo '::error::Terraform initialization failed. Check the bootstrap state bucket and deployer access.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-init.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
           if ! terraform -chdir=terraform validate -no-color >"$RUNNER_TEMP/iyi-validate.log" 2>&1; then
             echo '::error::Terraform validation failed. See the credential-free validation job for details.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-validate.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
       - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
@@ -311,10 +341,12 @@ jobs:
         run: |
           if ! terraform -chdir=terraform plan -input=false -no-color -out="$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.log" 2>&1; then
             echo '::error::Terraform plan failed. Check deployer permissions, state access and Terraform configuration.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-plan.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
           if ! terraform -chdir=terraform show -json "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-plan.json" 2>"$RUNNER_TEMP/iyi-show.log"; then
             echo '::error::Terraform could not read the saved plan.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-show.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
           python3 scripts/check-plan.py "$RUNNER_TEMP/iyi-plan.json"
@@ -327,6 +359,7 @@ jobs:
         run: |
           if ! terraform -chdir=terraform apply -input=false -no-color "$RUNNER_TEMP/iyi.tfplan" >"$RUNNER_TEMP/iyi-apply.log" 2>&1; then
             echo '::error::Terraform apply failed. Check deployer permissions and the affected resources before retrying.'
+            python3 scripts/print-sanitized-log.py "$RUNNER_TEMP/iyi-apply.log" || echo 'Terraform output withheld: it could not be sanitized.'
             exit 1
           fi
       - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2

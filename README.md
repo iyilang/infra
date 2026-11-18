@@ -10,6 +10,17 @@ branch in this repository, the plan job authenticates with a read-only
 Workload Identity principal, checks the plan, and posts a summary to the PR.
 Fork pull requests run the credential-free validation job only.
 
+The PR job checks whether the remote state object exists without reading it. If
+it does not, the job posts that the first `main` apply must initialize state
+and succeeds without running a plan. An existing-state PR plan uses
+`-lock=false` to avoid giving the PR identity write access. It is advisory and
+can reflect stale state during a concurrent apply; the `main` job runs its own
+plan with locking, checks it, and then applies it.
+
+Failed Terraform commands print bounded, redacted diagnostics. The plan JSON,
+saved plan, and state are not printed. Redaction covers known credential
+patterns, not every possible secret, so never put private values in inputs.
+
 The plan principal can read Terraform state. The configuration will record
 project and resource identifiers, service-account metadata, image references,
 public base URLs, bucket and secret names, and deployment settings. The budget
